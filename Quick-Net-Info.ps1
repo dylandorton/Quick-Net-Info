@@ -120,6 +120,7 @@ function Invoke-NetworkInfo {
             'OK'      { 'Green'  }
             'WARN'    { 'Yellow' }
             'FAIL'    { 'Red'    }
+            'INFO'    { 'Cyan'   }
             default   { 'White'  }
         }
         Write-Host ("  {0,-26}" -f "${label}:") -NoNewline -ForegroundColor DarkGray
@@ -164,7 +165,7 @@ function Invoke-NetworkInfo {
         $adapter = Get-NetAdapter |
             Where-Object {
                 $_.Status -eq 'Up' -and
-                $_.MediaType -match '802.3' -and
+                $_.MediaType -match '802\.3' -and
                 $_.PhysicalMediaType -notmatch 'Wireless|Native 802.11'
             } |
             Sort-Object Speed -Descending |
@@ -230,8 +231,12 @@ function Invoke-NetworkInfo {
     $prefixLen = $ipAddress.PrefixLength
 
     $subnetMask = if ($prefixLen) {
-        $mask = [uint32]([Math]::Pow(2,32) - [Math]::Pow(2, 32 - $prefixLen))
-        (([Net.IPAddress]$mask).GetAddressBytes() | ForEach-Object { $_ }) -join '.'
+        # [Net.IPAddress](long) treats its argument as network byte order, which reverses
+        # octets on little-endian Windows. Build the byte array directly to avoid this.
+        $mask  = [uint32]([Math]::Pow(2,32) - [Math]::Pow(2, 32 - $prefixLen))
+        $bytes = [BitConverter]::GetBytes($mask)
+        [Array]::Reverse($bytes)
+        $bytes -join '.'
     } else { 'N/A' }
 
     Write-Result "IPv4 address"    $(if ($ipAddress) { "$($ipAddress.IPAddress)/$prefixLen" } else { 'Not assigned' }) $(if ($ipAddress) {'OK'} else {'FAIL'})
@@ -260,15 +265,19 @@ function Invoke-NetworkInfo {
     Write-Result "DHCP"            $(if ($dhcpEnabled) { 'Enabled' } else { 'Disabled (static)' })
 
     if ($dhcpEnabled) {
+        # Read DHCP server from the per-adapter CIM record — this is the server that issued
+        # the lease, not an AD-wide list. Get-DhcpServerInDC was removed: it queries Active
+        # Directory for all registered DHCP servers and has no relation to this adapter's lease.
+        # The ipconfig /all fallback was also removed: it matched the first "DHCP Server" line
+        # across all adapters rather than filtering to $adapter.Name.
+        $dhcpServer = $null
         try {
-            $dhcpServer = (Get-DhcpServerInDC -ErrorAction Stop | Select-Object -First 1).IPAddress
-        } catch { $dhcpServer = $null }
-
-        if (-not $dhcpServer) {
-            $ipconfigAll = ipconfig /all 2>$null
-            $dhcpLine    = $ipconfigAll | Select-String "DHCP Server" | Select-Object -First 1
-            if ($dhcpLine) { $dhcpServer = ($dhcpLine -split ':\s+')[1].Trim() }
-        }
+            $nic = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration `
+                       -Filter "InterfaceIndex=$($adapter.ifIndex)" -ErrorAction Stop
+            if ($nic.DHCPServer -and $nic.DHCPServer -ne '255.255.255.255') {
+                $dhcpServer = $nic.DHCPServer
+            }
+        } catch {}
         Write-Result "DHCP server"    $(if ($dhcpServer) { $dhcpServer } else { 'Not detected' })
 
         $leaseInfo = netsh interface ip show address name=`"$($adapter.Name)`" 2>$null |
@@ -367,8 +376,19 @@ function Invoke-NetworkInfo {
                                 }
                                 $valueStr = -join $valueStr
                                 switch ($tlvType) {
-                                    2   { $lldpPort   = $valueStr -replace '[^\x20-\x7E]','' }  # Port ID
-                                    4   { $lldpPort   = $valueStr -replace '[^\x20-\x7E]','' }  # Port Description (overwrites)
+                                    2   {
+                                        # Port ID TLV value begins with a mandatory 1-byte subtype
+                                        # (IEEE 802.1AB). Skip it explicitly (2 hex chars) rather than
+                                        # relying on the printable-ASCII regex — the regex works by
+                                        # accident for ASCII subtypes (0x05, 0x07) but drops binary
+                                        # content for subtype 3 (MAC address), yielding empty output.
+                                        $portHex = if ($valueHex.Length -gt 2) { $valueHex.Substring(2) } else { '' }
+                                        $portStr = for ($j = 0; $j -lt $portHex.Length; $j += 2) {
+                                            [char][Convert]::ToByte($portHex.Substring($j, 2), 16)
+                                        }
+                                        $lldpPort = (-join $portStr) -replace '[^\x20-\x7E]',''
+                                    }
+                                    4   { $lldpPort   = $valueStr -replace '[^\x20-\x7E]','' }  # Port Description (no subtype byte)
                                     5   { $lldpSwitch = $valueStr -replace '[^\x20-\x7E]','' }  # System Name
                                     127 {
                                         # Organizationally Specific: OUI(3B) + subtype(1B) + data
@@ -378,9 +398,10 @@ function Invoke-NetworkInfo {
                                             $lldpVlan = [Convert]::ToUInt16($valueHex.Substring(8,4),16)
                                         }
                                     }
-                                    0   { break }
                                 }
                                 $pos += 4 + ($tlvLen * 2)
+                                # 'break' inside a switch exits the switch, not this while loop.
+                                # The loop termination lives here so it cannot be bypassed.
                                 if ($tlvType -eq 0) { break }
                             }
                         }
@@ -412,6 +433,7 @@ function Invoke-NetworkInfo {
                     }
                 } catch {
                     $null = pktmon stop 2>&1; $null = pktmon filter remove 2>&1
+                    Write-Result "LLDP/CDP capture" "Capture failed: $($_.Exception.Message)" FAIL
                 }
             } else {
                 Write-Result "LLDP/CDP capture" "pktmon not available on this OS version" WARN
@@ -475,11 +497,18 @@ function Invoke-NetworkInfo {
     $successTarget = $null
     foreach ($target in $PingTargets) {
         $pings = Invoke-PingTest $target $pingCount $GatewayTimeout
-        if ($pings) {
-            $rcv        = ($pings | Measure-Object).Count
+        # PS7 returns TimedOut-status objects instead of null for unreachable hosts;
+        # filter to only successful replies so $rcv and RTT are never inflated by timeouts.
+        $succeeded = if ($PSVersionTable.PSVersion.Major -ge 6) {
+            @($pings | Where-Object { $_.Status -eq 'Success' })
+        } else {
+            @($pings)
+        }
+        if ($succeeded.Count -gt 0) {
+            $rcv        = $succeeded.Count
             $loss       = [int](($pingCount - $rcv) / $pingCount * 100)
             $lossStatus = if ($loss -eq 0) {'OK'} elseif ($loss -le 20) {'WARN'} else {'FAIL'}
-            Write-Result "Internet ($target)"  "$(Get-PingRtt $pings) ms" OK
+            Write-Result "Internet ($target)"  "$(Get-PingRtt $succeeded) ms" OK
             Write-Result "Packet loss"         "$loss%" $lossStatus
             $internetOK    = $true
             $successTarget = $target
@@ -569,7 +598,7 @@ if ($AdapterName) {
     $allAdapters = Get-NetAdapter |
         Where-Object {
             $_.Status -eq 'Up' -and
-            $_.MediaType -match '802.3' -and
+            $_.MediaType -match '802\.3' -and
             $_.PhysicalMediaType -notmatch 'Wireless|Native 802.11'
         } |
         Sort-Object Speed -Descending
